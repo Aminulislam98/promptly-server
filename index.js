@@ -2,15 +2,25 @@ const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const jwt = require("jsonwebtoken");
-const bcrypt = require("bcryptjs");
+const { toNodeHandler } = require("better-auth/node");
 
 dotenv.config();
 
 const app = express();
 const port = process.env.PORT || 4000;
 
-app.use(cors({ origin: process.env.CLIENT_URL || "http://localhost:3000" }));
+// cors must allow credentials for Better Auth cookies
+app.use(
+  cors({
+    origin: process.env.CLIENT_URL || "http://localhost:3000",
+    credentials: true,
+  }),
+);
+
+// Better Auth handler — must come before express.json()
+const { auth } = require("./auth");
+app.all("/api/auth/*", toNodeHandler(auth));
+
 app.use(express.json());
 
 const client = new MongoClient(process.env.MONGODB_URI, {
@@ -39,16 +49,18 @@ async function run() {
     const reportsCollection = db.collection("reports");
     const creatorRequestsCollection = db.collection("creatorRequests");
 
-    // verify JWT token
-    const verifyToken = (req, res, next) => {
-      const authHeader = req.headers.authorization;
-      if (!authHeader) return res.status(401).send({ message: "Unauthorized" });
-      const token = authHeader.split(" ")[1];
-      jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err) return res.status(401).send({ message: "Unauthorized" });
-        req.user = decoded;
+    // verify token using Better Auth session
+    const verifyToken = async (req, res, next) => {
+      try {
+        const session = await auth.api.getSession({
+          headers: req.headers,
+        });
+        if (!session) return res.status(401).send({ message: "Unauthorized" });
+        req.user = session.user;
         next();
-      });
+      } catch {
+        return res.status(401).send({ message: "Unauthorized" });
+      }
     };
 
     // verify admin role
@@ -59,55 +71,19 @@ async function run() {
     };
 
     // auth routes
-    app.post("/api/auth/register", async (req, res) => {
-      const { name, email, password, image } = req.body;
-      if (!name || !email || !password)
-        return res.status(400).send({ message: "All fields required" });
-
-      const existing = await usersCollection.findOne({ email });
-      if (existing)
-        return res.status(409).send({ message: "Email already registered" });
-
-      const hashedPassword = await bcrypt.hash(password, 10);
-      const newUser = {
-        name,
-        email,
-        image: image || "",
-        password: hashedPassword,
-        role: "user",
-        isPremium: false,
-        createdAt: new Date(),
-      };
-      const result = await usersCollection.insertOne(newUser);
-      res.status(201).json({ success: true, result });
-    });
-
-    app.post("/api/auth/login", async (req, res) => {
-      const { email, password } = req.body;
-      const user = await usersCollection.findOne({ email });
-      if (!user) return res.status(404).send({ message: "User not found" });
-
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch)
-        return res.status(401).send({ message: "Invalid password" });
-
-      const token = jwt.sign(
-        { id: user._id, email: user.email, role: user.role },
-        process.env.JWT_SECRET,
-        { expiresIn: "7d" },
-      );
-
-      res.json({
-        success: true,
-        token,
-        user: {
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          isPremium: user.isPremium,
-          image: user.image,
-        },
-      });
+    app.post("/api/auth/sync-user", verifyToken, async (req, res) => {
+      const existing = await usersCollection.findOne({ email: req.user.email });
+      if (!existing) {
+        await usersCollection.insertOne({
+          email: req.user.email,
+          name: req.user.name,
+          image: req.user.image || "",
+          role: "user",
+          isPremium: false,
+          createdAt: new Date(),
+        });
+      }
+      res.json({ success: true });
     });
 
     // prompt routes
@@ -171,20 +147,20 @@ async function run() {
     app.post("/api/prompts", verifyToken, async (req, res) => {
       const user = await usersCollection.findOne({ email: req.user.email });
 
-      if (user.role === "user") {
+      if (!user || user.role === "user") {
         const count = await promptsCollection.countDocuments({
           creatorEmail: req.user.email,
         });
         if (count >= 3)
-          return res
-            .status(403)
-            .send({ message: "Free users can only add 3 prompts" });
+          return res.status(403).send({
+            message: "Free users can only add 3 prompts. Upgrade to Premium.",
+          });
       }
 
       const prompt = {
         ...req.body,
         creatorEmail: req.user.email,
-        creatorName: user.name,
+        creatorName: req.user.name,
         copyCount: 0,
         status: "pending",
         featured: false,
@@ -271,7 +247,21 @@ async function run() {
         .find({ userEmail: req.user.email })
         .sort({ createdAt: -1 })
         .toArray();
-      res.json({ success: true, bookmarks });
+
+      // populate prompt data
+      const populated = await Promise.all(
+        bookmarks.map(async (b) => {
+          const prompt = await promptsCollection.findOne(
+            { _id: new ObjectId(b.promptId) },
+            {
+              projection: { title: 1, category: 1, aiTool: 1, creatorName: 1 },
+            },
+          );
+          return { ...b, prompt };
+        }),
+      );
+
+      res.json({ success: true, bookmarks: populated });
     });
 
     app.post("/api/bookmarks", verifyToken, async (req, res) => {
@@ -346,7 +336,7 @@ async function run() {
       res.json({ success: true, user });
     });
 
-    // top creators using aggregation
+    // top creators aggregation
     app.get("/api/top-creators", async (req, res) => {
       const creators = await promptsCollection
         .aggregate([
@@ -404,8 +394,10 @@ async function run() {
 
       await paymentsCollection.insertOne({
         email: req.user.email,
+        name: req.user.name,
         transactionId: session.payment_intent,
         amount: 5,
+        status: "success",
         date: new Date(),
       });
 
@@ -480,7 +472,10 @@ async function run() {
         const result = await promptsCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
           {
-            $set: { status: "rejected", rejectionFeedback: req.body.feedback },
+            $set: {
+              status: "rejected",
+              rejectionFeedback: req.body.feedback,
+            },
           },
         );
         res.json({ success: true, result });
@@ -499,6 +494,18 @@ async function run() {
           { _id: new ObjectId(req.params.id) },
           { $set: { featured: !prompt.featured } },
         );
+        res.json({ success: true, result });
+      },
+    );
+
+    app.delete(
+      "/api/admin/prompts/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const result = await promptsCollection.deleteOne({
+          _id: new ObjectId(req.params.id),
+        });
         res.json({ success: true, result });
       },
     );
