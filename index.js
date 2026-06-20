@@ -75,7 +75,7 @@ async function run() {
         page = 1,
         limit = 12,
       } = req.query;
-      const query = { status: "approved", visibility: "Public" };
+      const query = { status: "approved" };
       if (search) {
         query.$or = [
           { title: { $regex: search, $options: "i" } },
@@ -126,11 +126,9 @@ async function run() {
       const user = await userCollection.findOne({ email: req.user.email });
 
       if (user?.isSuspended) {
-        return res
-          .status(403)
-          .send({
-            message: "Your account is suspended. You cannot add prompts.",
-          });
+        return res.status(403).send({
+          message: "Your account is suspended. You cannot add prompts.",
+        });
       }
 
       if (user?.role === "user") {
@@ -138,11 +136,10 @@ async function run() {
           creatorEmail: req.user.email,
         });
         if (count >= 3)
-          return res
-            .status(403)
-            .send({
-              message: "Free users can only add 3 prompts. Upgrade to Premium.",
-            });
+          return res.status(403).send({
+            message:
+              "Free users can only add 3 prompts. Become a Creator to publish unlimited prompts.",
+          });
       }
 
       const prompt = {
@@ -664,6 +661,55 @@ async function run() {
         res.json({ success: true });
       },
     );
+
+    app.get("/api/creator/analytics", verifyToken, async (req, res) => {
+      const prompts = await promptsCollection
+        .find({ creatorEmail: req.user.email })
+        .sort({ createdAt: 1 })
+        .toArray();
+
+      const totalPrompts = prompts.length;
+      const totalCopies = prompts.reduce(
+        (sum, p) => sum + (p.copyCount || 0),
+        0,
+      );
+      const totalBookmarks = await bookmarksCollection.countDocuments({
+        promptId: { $in: prompts.map((p) => String(p._id)) },
+      });
+
+      const chartData = [];
+      for (let i = 5; i >= 0; i--) {
+        const date = new Date();
+        date.setMonth(date.getMonth() - i);
+        const month = date.toLocaleString("en-GB", { month: "short" });
+        const monthStart = new Date(date.getFullYear(), date.getMonth(), 1);
+        const monthEnd = new Date(date.getFullYear(), date.getMonth() + 1, 1);
+
+        const monthPrompts = prompts.filter((p) => {
+          const d = new Date(p.createdAt);
+          return d >= monthStart && d < monthEnd;
+        });
+
+        const monthCopies = monthPrompts.reduce(
+          (sum, p) => sum + (p.copyCount || 0),
+          0,
+        );
+
+        chartData.push({
+          month,
+          prompts: monthPrompts.length,
+          copies: monthCopies,
+        });
+      }
+
+      res.json({
+        success: true,
+        totalPrompts,
+        totalCopies,
+        totalBookmarks,
+        chartData,
+      });
+    });
 
     app.get(
       "/api/admin/analytics",
