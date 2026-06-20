@@ -1,29 +1,25 @@
 const express = require("express");
 const cors = require("cors");
-const dotenv = require("dotenv");
-const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
-const { toNodeHandler } = require("better-auth/node");
-
-dotenv.config();
-
 const app = express();
 const port = process.env.PORT || 4000;
+require("dotenv").config();
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
-// cors must allow credentials for Better Auth cookies
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
     credentials: true,
   }),
 );
-
-// Better Auth handler — must come before express.json()
-const { auth } = require("./auth");
-app.all("/api/auth/*", toNodeHandler(auth));
-
 app.use(express.json());
 
-const client = new MongoClient(process.env.MONGODB_URI, {
+const uri = process.env.MONGODB_URI;
+
+app.get("/", (req, res) => {
+  res.send("Promptly server is running!");
+});
+
+const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
     strict: true,
@@ -31,16 +27,13 @@ const client = new MongoClient(process.env.MONGODB_URI, {
   },
 });
 
-app.get("/", (req, res) => {
-  res.send("Promptly server is running!");
-});
-
 async function run() {
   try {
     await client.connect();
 
     const db = client.db("promptly");
-
+    const sessionCollection = db.collection("session");
+    const userCollection = db.collection("user");
     const usersCollection = db.collection("users");
     const promptsCollection = db.collection("prompts");
     const reviewsCollection = db.collection("reviews");
@@ -49,42 +42,41 @@ async function run() {
     const reportsCollection = db.collection("reports");
     const creatorRequestsCollection = db.collection("creatorRequests");
 
-    // verify token using Better Auth session
+    // verify token from Better Auth session collection — same as previous project
     const verifyToken = async (req, res, next) => {
-      try {
-        const session = await auth.api.getSession({
-          headers: req.headers,
-        });
-        if (!session) return res.status(401).send({ message: "Unauthorized" });
-        req.user = session.user;
-        next();
-      } catch {
-        return res.status(401).send({ message: "Unauthorized" });
+      const authHeader = req?.headers?.authorization;
+      if (!authHeader) {
+        return res.status(401).send({ message: "unauthorized access" });
       }
-    };
+      const token = authHeader.split(" ")[1];
+      if (!token) {
+        return res.status(401).send({ message: "unauthorized access" });
+      }
 
-    // verify admin role
-    const verifyAdmin = (req, res, next) => {
-      if (req.user?.role !== "admin")
-        return res.status(403).send({ message: "Forbidden" });
+      const session = await sessionCollection.findOne({ token });
+      if (!session) {
+        return res.status(401).send({ message: "unauthorized access" });
+      }
+
+      if (new Date(session.expiresAt) < new Date()) {
+        return res.status(401).send({ message: "session expired" });
+      }
+
+      const user = await userCollection.findOne({ _id: session.userId });
+      if (!user) {
+        return res.status(401).send({ message: "unauthorized access" });
+      }
+
+      req.user = user;
       next();
     };
 
-    // auth routes
-    app.post("/api/auth/sync-user", verifyToken, async (req, res) => {
-      const existing = await usersCollection.findOne({ email: req.user.email });
-      if (!existing) {
-        await usersCollection.insertOne({
-          email: req.user.email,
-          name: req.user.name,
-          image: req.user.image || "",
-          role: "user",
-          isPremium: false,
-          createdAt: new Date(),
-        });
+    const verifyAdmin = async (req, res, next) => {
+      if (req.user?.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
       }
-      res.json({ success: true });
-    });
+      next();
+    };
 
     // prompt routes
     app.get("/api/prompts", async (req, res) => {
@@ -97,7 +89,6 @@ async function run() {
         page = 1,
         limit = 12,
       } = req.query;
-
       const query = { status: "approved", visibility: "Public" };
 
       if (search) {
@@ -137,17 +128,20 @@ async function run() {
     });
 
     app.get("/api/prompts/:id", async (req, res) => {
-      const prompt = await promptsCollection.findOne({
-        _id: new ObjectId(req.params.id),
-      });
-      if (!prompt) return res.status(404).send({ message: "Prompt not found" });
-      res.json({ success: true, prompt });
+      try {
+        const prompt = await promptsCollection.findOne({
+          _id: new ObjectId(req.params.id),
+        });
+        if (!prompt)
+          return res.status(404).send({ message: "Prompt not found" });
+        res.json({ success: true, prompt });
+      } catch {
+        res.status(400).send({ message: "Invalid ID" });
+      }
     });
 
     app.post("/api/prompts", verifyToken, async (req, res) => {
-      const user = await usersCollection.findOne({ email: req.user.email });
-
-      if (!user || user.role === "user") {
+      if (req.user.role === "user") {
         const count = await promptsCollection.countDocuments({
           creatorEmail: req.user.email,
         });
@@ -156,7 +150,6 @@ async function run() {
             message: "Free users can only add 3 prompts. Upgrade to Premium.",
           });
       }
-
       const prompt = {
         ...req.body,
         creatorEmail: req.user.email,
@@ -167,7 +160,7 @@ async function run() {
         createdAt: new Date(),
       };
       const result = await promptsCollection.insertOne(prompt);
-      res.status(201).json({ success: true, result });
+      res.json({ success: true, result });
     });
 
     app.patch("/api/prompts/:id", verifyToken, async (req, res) => {
@@ -222,7 +215,7 @@ async function run() {
         createdAt: new Date(),
       };
       const result = await reviewsCollection.insertOne(review);
-      res.status(201).json({ success: true, result });
+      res.json({ success: true, result });
     });
 
     app.get("/api/my-reviews", verifyToken, async (req, res) => {
@@ -248,19 +241,26 @@ async function run() {
         .sort({ createdAt: -1 })
         .toArray();
 
-      // populate prompt data
       const populated = await Promise.all(
         bookmarks.map(async (b) => {
-          const prompt = await promptsCollection.findOne(
-            { _id: new ObjectId(b.promptId) },
-            {
-              projection: { title: 1, category: 1, aiTool: 1, creatorName: 1 },
-            },
-          );
-          return { ...b, prompt };
+          try {
+            const prompt = await promptsCollection.findOne(
+              { _id: new ObjectId(b.promptId) },
+              {
+                projection: {
+                  title: 1,
+                  category: 1,
+                  aiTool: 1,
+                  creatorName: 1,
+                },
+              },
+            );
+            return { ...b, prompt };
+          } catch {
+            return b;
+          }
         }),
       );
-
       res.json({ success: true, bookmarks: populated });
     });
 
@@ -279,7 +279,7 @@ async function run() {
         userEmail: req.user.email,
         createdAt: new Date(),
       });
-      res.status(201).json({ success: true, action: "added", result });
+      res.json({ success: true, action: "added", result });
     });
 
     app.delete("/api/bookmarks/:promptId", verifyToken, async (req, res) => {
@@ -298,7 +298,7 @@ async function run() {
         createdAt: new Date(),
       };
       const result = await reportsCollection.insertOne(report);
-      res.status(201).json({ success: true, result });
+      res.json({ success: true, result });
     });
 
     // creator request routes
@@ -317,7 +317,7 @@ async function run() {
         createdAt: new Date(),
       };
       const result = await creatorRequestsCollection.insertOne(request);
-      res.status(201).json({ success: true, result });
+      res.json({ success: true, result });
     });
 
     app.get("/api/creator-requests/status", verifyToken, async (req, res) => {
@@ -329,11 +329,7 @@ async function run() {
 
     // user profile
     app.get("/api/users/me", verifyToken, async (req, res) => {
-      const user = await usersCollection.findOne(
-        { email: req.user.email },
-        { projection: { password: 0 } },
-      );
-      res.json({ success: true, user });
+      res.json({ success: true, user: req.user });
     });
 
     // top creators aggregation
@@ -383,15 +379,13 @@ async function run() {
       const { sessionId } = req.body;
       const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
       const session = await stripe.checkout.sessions.retrieve(sessionId);
-
       if (session.payment_status !== "paid")
         return res.status(400).send({ message: "Payment not completed" });
 
-      await usersCollection.updateOne(
-        { email: req.user.email },
+      await userCollection.updateOne(
+        { _id: req.user._id },
         { $set: { isPremium: true } },
       );
-
       await paymentsCollection.insertOne({
         email: req.user.email,
         name: req.user.name,
@@ -400,13 +394,12 @@ async function run() {
         status: "success",
         date: new Date(),
       });
-
       res.json({ success: true, message: "Premium unlocked!" });
     });
 
     // admin routes
     app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
-      const users = await usersCollection
+      const users = await userCollection
         .find({}, { projection: { password: 0 } })
         .sort({ createdAt: -1 })
         .toArray();
@@ -418,7 +411,7 @@ async function run() {
       verifyToken,
       verifyAdmin,
       async (req, res) => {
-        const result = await usersCollection.updateOne(
+        const result = await userCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
           { $set: { role: req.body.role } },
         );
@@ -431,7 +424,7 @@ async function run() {
       verifyToken,
       verifyAdmin,
       async (req, res) => {
-        const result = await usersCollection.deleteOne({
+        const result = await userCollection.deleteOne({
           _id: new ObjectId(req.params.id),
         });
         res.json({ success: true, result });
@@ -472,10 +465,7 @@ async function run() {
         const result = await promptsCollection.updateOne(
           { _id: new ObjectId(req.params.id) },
           {
-            $set: {
-              status: "rejected",
-              rejectionFeedback: req.body.feedback,
-            },
+            $set: { status: "rejected", rejectionFeedback: req.body.feedback },
           },
         );
         res.json({ success: true, result });
@@ -556,7 +546,7 @@ async function run() {
         const report = await reportsCollection.findOne({
           _id: new ObjectId(req.params.id),
         });
-        await usersCollection.updateOne(
+        await userCollection.updateOne(
           { email: report.creatorEmail },
           { $push: { warnings: { reason: report.reason, date: new Date() } } },
         );
@@ -585,8 +575,8 @@ async function run() {
         const request = await creatorRequestsCollection.findOne({
           _id: new ObjectId(req.params.id),
         });
-        await usersCollection.updateOne(
-          { email: request.userEmail },
+        await userCollection.updateOne(
+          { _id: request.userId },
           { $set: { role: "creator" } },
         );
         await creatorRequestsCollection.updateOne(
@@ -617,7 +607,7 @@ async function run() {
       async (req, res) => {
         const [totalUsers, totalPrompts, totalReviews, totalCopiesResult] =
           await Promise.all([
-            usersCollection.countDocuments(),
+            userCollection.countDocuments(),
             promptsCollection.countDocuments(),
             reviewsCollection.countDocuments(),
             promptsCollection
@@ -639,8 +629,8 @@ async function run() {
 
     await client.db("admin").command({ ping: 1 });
     console.log("Connected to MongoDB Atlas");
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
+  } finally {
+    // await client.close();
   }
 }
 
