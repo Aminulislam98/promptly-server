@@ -15,9 +15,7 @@ app.use(express.json());
 
 const uri = process.env.MONGODB_URI;
 
-app.get("/", (req, res) => {
-  res.send("Promptly server is running!");
-});
+app.get("/", (req, res) => res.send("Promptly server is running!"));
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -34,7 +32,6 @@ async function run() {
     const db = client.db("promptly");
     const sessionCollection = db.collection("session");
     const userCollection = db.collection("user");
-    const usersCollection = db.collection("users");
     const promptsCollection = db.collection("prompts");
     const reviewsCollection = db.collection("reviews");
     const bookmarksCollection = db.collection("bookmarks");
@@ -42,39 +39,28 @@ async function run() {
     const reportsCollection = db.collection("reports");
     const creatorRequestsCollection = db.collection("creatorRequests");
 
-    // verify token from Better Auth session collection — same as previous project
     const verifyToken = async (req, res, next) => {
       const authHeader = req?.headers?.authorization;
-      if (!authHeader) {
+      if (!authHeader)
         return res.status(401).send({ message: "unauthorized access" });
-      }
       const token = authHeader.split(" ")[1];
-      if (!token) {
+      if (!token)
         return res.status(401).send({ message: "unauthorized access" });
-      }
-
       const session = await sessionCollection.findOne({ token });
-      if (!session) {
+      if (!session)
         return res.status(401).send({ message: "unauthorized access" });
-      }
-
-      if (new Date(session.expiresAt) < new Date()) {
+      if (new Date(session.expiresAt) < new Date())
         return res.status(401).send({ message: "session expired" });
-      }
-
       const user = await userCollection.findOne({ _id: session.userId });
-      if (!user) {
+      if (!user)
         return res.status(401).send({ message: "unauthorized access" });
-      }
-
       req.user = user;
       next();
     };
 
     const verifyAdmin = async (req, res, next) => {
-      if (req.user?.role !== "admin") {
+      if (req.user?.role !== "admin")
         return res.status(403).send({ message: "forbidden access" });
-      }
       next();
     };
 
@@ -90,7 +76,6 @@ async function run() {
         limit = 12,
       } = req.query;
       const query = { status: "approved", visibility: "Public" };
-
       if (search) {
         query.$or = [
           { title: { $regex: search, $options: "i" } },
@@ -101,11 +86,9 @@ async function run() {
       if (category && category !== "All") query.category = category;
       if (aiTool && aiTool !== "All") query.aiTool = aiTool;
       if (difficulty && difficulty !== "All") query.difficulty = difficulty;
-
       let sortOption = { createdAt: -1 };
       if (sort === "copies" || sort === "popular")
         sortOption = { copyCount: -1 };
-
       const skip = (parseInt(page) - 1) * parseInt(limit);
       const total = await promptsCollection.countDocuments(query);
       const prompts = await promptsCollection
@@ -114,7 +97,6 @@ async function run() {
         .skip(skip)
         .limit(parseInt(limit))
         .toArray();
-
       res.json({ success: true, prompts, total, page: parseInt(page) });
     });
 
@@ -141,15 +123,28 @@ async function run() {
     });
 
     app.post("/api/prompts", verifyToken, async (req, res) => {
-      if (req.user.role === "user") {
+      const user = await userCollection.findOne({ email: req.user.email });
+
+      if (user?.isSuspended) {
+        return res
+          .status(403)
+          .send({
+            message: "Your account is suspended. You cannot add prompts.",
+          });
+      }
+
+      if (user?.role === "user") {
         const count = await promptsCollection.countDocuments({
           creatorEmail: req.user.email,
         });
         if (count >= 3)
-          return res.status(403).send({
-            message: "Free users can only add 3 prompts. Upgrade to Premium.",
-          });
+          return res
+            .status(403)
+            .send({
+              message: "Free users can only add 3 prompts. Upgrade to Premium.",
+            });
       }
+
       const prompt = {
         ...req.body,
         creatorEmail: req.user.email,
@@ -240,7 +235,6 @@ async function run() {
         .find({ userEmail: req.user.email })
         .sort({ createdAt: -1 })
         .toArray();
-
       const populated = await Promise.all(
         bookmarks.map(async (b) => {
           try {
@@ -309,7 +303,6 @@ async function run() {
       });
       if (existing)
         return res.status(409).send({ message: "Request already pending" });
-
       const request = {
         ...req.body,
         userEmail: req.user.email,
@@ -327,9 +320,13 @@ async function run() {
       res.json({ success: true, request });
     });
 
-    // user profile
+    // user profile — fresh from MongoDB
     app.get("/api/users/me", verifyToken, async (req, res) => {
-      res.json({ success: true, user: req.user });
+      const user = await userCollection.findOne(
+        { _id: req.user._id },
+        { projection: { password: 0 } },
+      );
+      res.json({ success: true, user });
     });
 
     // top creators aggregation
@@ -354,25 +351,30 @@ async function run() {
 
     // payment routes
     app.post("/api/payment/create-checkout", verifyToken, async (req, res) => {
-      const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-      const session = await stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        mode: "payment",
-        line_items: [
-          {
-            price_data: {
-              currency: "usd",
-              product_data: { name: "Promptly Premium" },
-              unit_amount: 500,
+      try {
+        const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+        const session = await stripe.checkout.sessions.create({
+          payment_method_types: ["card"],
+          mode: "payment",
+          line_items: [
+            {
+              price_data: {
+                currency: "usd",
+                product_data: { name: "Promptly Premium" },
+                unit_amount: 500,
+              },
+              quantity: 1,
             },
-            quantity: 1,
-          },
-        ],
-        success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.CLIENT_URL}/payment`,
-        customer_email: req.user.email,
-      });
-      res.json({ success: true, url: session.url });
+          ],
+          success_url: `${process.env.CLIENT_URL}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.CLIENT_URL}/payment`,
+          customer_email: req.user.email,
+        });
+        res.json({ success: true, url: session.url });
+      } catch (err) {
+        console.error("Stripe error:", err.message);
+        res.status(500).json({ message: err.message });
+      }
     });
 
     app.post("/api/payment/success", verifyToken, async (req, res) => {
@@ -381,7 +383,6 @@ async function run() {
       const session = await stripe.checkout.sessions.retrieve(sessionId);
       if (session.payment_status !== "paid")
         return res.status(400).send({ message: "Payment not completed" });
-
       await userCollection.updateOne(
         { _id: req.user._id },
         { $set: { isPremium: true } },
@@ -543,14 +544,78 @@ async function run() {
       verifyToken,
       verifyAdmin,
       async (req, res) => {
-        const report = await reportsCollection.findOne({
-          _id: new ObjectId(req.params.id),
-        });
-        await userCollection.updateOne(
-          { email: report.creatorEmail },
-          { $push: { warnings: { reason: report.reason, date: new Date() } } },
-        );
-        res.json({ success: true, message: "Warning sent" });
+        try {
+          const report = await reportsCollection.findOne({
+            _id: new ObjectId(req.params.id),
+          });
+          if (!report)
+            return res.status(404).send({ message: "Report not found" });
+
+          // get creator email from prompt if not in report
+          let creatorEmail = report.creatorEmail;
+          if (!creatorEmail && report.promptId) {
+            try {
+              const prompt = await promptsCollection.findOne({
+                _id: new ObjectId(report.promptId),
+              });
+              creatorEmail = prompt?.creatorEmail;
+            } catch {}
+          }
+
+          if (!creatorEmail)
+            return res.status(400).send({ message: "Creator not found" });
+
+          // add warning
+          await userCollection.updateOne(
+            { email: creatorEmail },
+            {
+              $push: {
+                warnings: {
+                  reason: report.reason,
+                  promptId: report.promptId,
+                  date: new Date(),
+                },
+              },
+            },
+          );
+
+          // check count
+          const creator = await userCollection.findOne({ email: creatorEmail });
+          const warningCount = creator?.warnings?.length || 0;
+
+          // 3+ warnings = suspend + remove prompt
+          if (warningCount >= 3) {
+            await userCollection.updateOne(
+              { email: creatorEmail },
+              { $set: { isSuspended: true } },
+            );
+            if (report.promptId) {
+              try {
+                await promptsCollection.deleteOne({
+                  _id: new ObjectId(report.promptId),
+                });
+              } catch {}
+            }
+          }
+
+          // mark report warned
+          await reportsCollection.updateOne(
+            { _id: new ObjectId(req.params.id) },
+            { $set: { warned: true } },
+          );
+
+          res.json({
+            success: true,
+            message:
+              warningCount >= 3
+                ? "Creator suspended and prompt removed"
+                : "Warning sent",
+            suspended: warningCount >= 3,
+          });
+        } catch (err) {
+          console.error("Warn error:", err.message);
+          res.status(500).json({ message: err.message });
+        }
       },
     );
 
@@ -636,6 +701,4 @@ async function run() {
 
 run().catch(console.dir);
 
-app.listen(port, () => {
-  console.log(`Promptly server running on port ${port}`);
-});
+app.listen(port, () => console.log(`Promptly server running on port ${port}`));
