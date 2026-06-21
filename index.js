@@ -64,7 +64,7 @@ async function run() {
       next();
     };
 
-    // prompt routes — public (emails stripped from responses)
+    // prompt routes — public
     app.get("/api/prompts", async (req, res) => {
       const {
         search,
@@ -213,6 +213,28 @@ async function run() {
         createdAt: new Date(),
       };
       const result = await reviewsCollection.insertOne(review);
+
+      // Keep avgRating + reviewCount on the prompt document so cards can show stars
+      if (req.body.promptId) {
+        try {
+          const allReviews = await reviewsCollection
+            .find({ promptId: req.body.promptId })
+            .toArray();
+          const avg =
+            allReviews.reduce((s, r) => s + (r.rating || 0), 0) /
+            allReviews.length;
+          await promptsCollection.updateOne(
+            { _id: new ObjectId(req.body.promptId) },
+            {
+              $set: {
+                avgRating: Math.round(avg * 10) / 10,
+                reviewCount: allReviews.length,
+              },
+            },
+          );
+        } catch {}
+      }
+
       res.json({ success: true, result });
     });
 
@@ -225,10 +247,42 @@ async function run() {
     });
 
     app.delete("/api/reviews/:id", verifyToken, async (req, res) => {
+      // fetch before delete so we know which prompt to re-average
+      const review = await reviewsCollection.findOne({
+        _id: new ObjectId(req.params.id),
+        userEmail: req.user.email,
+      });
       const result = await reviewsCollection.deleteOne({
         _id: new ObjectId(req.params.id),
         userEmail: req.user.email,
       });
+      // keep avgRating in sync after deletion
+      if (review?.promptId) {
+        try {
+          const remaining = await reviewsCollection
+            .find({ promptId: review.promptId })
+            .toArray();
+          if (remaining.length === 0) {
+            await promptsCollection.updateOne(
+              { _id: new ObjectId(review.promptId) },
+              { $set: { avgRating: 0, reviewCount: 0 } },
+            );
+          } else {
+            const avg =
+              remaining.reduce((s, r) => s + (r.rating || 0), 0) /
+              remaining.length;
+            await promptsCollection.updateOne(
+              { _id: new ObjectId(review.promptId) },
+              {
+                $set: {
+                  avgRating: Math.round(avg * 10) / 10,
+                  reviewCount: remaining.length,
+                },
+              },
+            );
+          }
+        } catch {}
+      }
       res.json({ success: true, result });
     });
 
@@ -332,7 +386,20 @@ async function run() {
       res.json({ success: true, user });
     });
 
-    // top creators — public, email excluded from response
+    // public creator profile — returns all approved prompts by a creator name
+    app.get("/api/creators/:name/prompts", async (req, res) => {
+      const name = decodeURIComponent(req.params.name);
+      const prompts = await promptsCollection
+        .find(
+          { creatorName: name, status: "approved" },
+          { projection: { creatorEmail: 0 } },
+        )
+        .sort({ createdAt: -1 })
+        .toArray();
+      res.json({ success: true, prompts, creator: name });
+    });
+
+    // top creators — public
     app.get("/api/top-creators", async (req, res) => {
       const creators = await promptsCollection
         .aggregate([
