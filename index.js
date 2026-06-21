@@ -548,7 +548,6 @@ async function run() {
           if (!report)
             return res.status(404).send({ message: "Report not found" });
 
-          // get creator email from prompt if not in report
           let creatorEmail = report.creatorEmail;
           if (!creatorEmail && report.promptId) {
             try {
@@ -562,7 +561,6 @@ async function run() {
           if (!creatorEmail)
             return res.status(400).send({ message: "Creator not found" });
 
-          // add warning
           await userCollection.updateOne(
             { email: creatorEmail },
             {
@@ -576,11 +574,9 @@ async function run() {
             },
           );
 
-          // check count
           const creator = await userCollection.findOne({ email: creatorEmail });
           const warningCount = creator?.warnings?.length || 0;
 
-          // 3+ warnings = suspend + remove prompt
           if (warningCount >= 3) {
             await userCollection.updateOne(
               { email: creatorEmail },
@@ -595,7 +591,6 @@ async function run() {
             }
           }
 
-          // mark report warned
           await reportsCollection.updateOne(
             { _id: new ObjectId(req.params.id) },
             { $set: { warned: true } },
@@ -745,9 +740,24 @@ async function run() {
   }
 }
 
-run().catch(console.dir);
+// Cache the DB connection — only runs once per cold start
+let _runPromise = null;
+function ensureDB() {
+  if (!_runPromise) _runPromise = run();
+  return _runPromise;
+}
 
-// Only listen locally, Vercel handles this in production
+// Block every request until DB is connected and routes are registered
+app.use(async (req, res, next) => {
+  try {
+    await ensureDB();
+    next();
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Database connection failed" });
+  }
+});
+
 if (require.main === module) {
   app.listen(port, () =>
     console.log(`Promptly server running on port ${port}`),
