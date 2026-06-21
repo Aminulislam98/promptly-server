@@ -64,8 +64,8 @@ async function run() {
       next();
     };
 
-    // prompt routes
-    app.get("/api/prompts", verifyToken, async (req, res) => {
+    // prompt routes — public (emails stripped from responses)
+    app.get("/api/prompts", async (req, res) => {
       const {
         search,
         category,
@@ -100,7 +100,7 @@ async function run() {
       res.json({ success: true, prompts, total, page: parseInt(page) });
     });
 
-    app.get("/api/prompts/featured", verifyToken, async (req, res) => {
+    app.get("/api/prompts/featured", async (req, res) => {
       const prompts = await promptsCollection
         .find(
           { status: "approved", visibility: "Public" },
@@ -332,8 +332,8 @@ async function run() {
       res.json({ success: true, user });
     });
 
-    // top creators — email excluded from response
-    app.get("/api/top-creators", verifyToken, async (req, res) => {
+    // top creators — public, email excluded from response
+    app.get("/api/top-creators", async (req, res) => {
       const creators = await promptsCollection
         .aggregate([
           { $match: { status: "approved" } },
