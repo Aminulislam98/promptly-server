@@ -747,4 +747,11 @@ async function run() {
 
 run().catch(console.dir);
 
-app.listen(port, () => console.log(`Promptly server running on port ${port}`));
+// Only listen locally, Vercel handles this in production
+if (require.main === module) {
+  app.listen(port, () =>
+    console.log(`Promptly server running on port ${port}`),
+  );
+}
+
+module.exports = app;
