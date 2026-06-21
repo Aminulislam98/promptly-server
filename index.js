@@ -65,7 +65,7 @@ async function run() {
     };
 
     // prompt routes
-    app.get("/api/prompts", async (req, res) => {
+    app.get("/api/prompts", verifyToken, async (req, res) => {
       const {
         search,
         category,
@@ -92,7 +92,7 @@ async function run() {
       const skip = (parseInt(page) - 1) * parseInt(limit);
       const total = await promptsCollection.countDocuments(query);
       const prompts = await promptsCollection
-        .find(query)
+        .find(query, { projection: { creatorEmail: 0 } })
         .sort(sortOption)
         .skip(skip)
         .limit(parseInt(limit))
@@ -100,9 +100,12 @@ async function run() {
       res.json({ success: true, prompts, total, page: parseInt(page) });
     });
 
-    app.get("/api/prompts/featured", async (req, res) => {
+    app.get("/api/prompts/featured", verifyToken, async (req, res) => {
       const prompts = await promptsCollection
-        .find({ status: "approved", visibility: "Public" })
+        .find(
+          { status: "approved", visibility: "Public" },
+          { projection: { creatorEmail: 0 } },
+        )
         .sort({ copyCount: -1 })
         .limit(6)
         .toArray();
@@ -192,9 +195,12 @@ async function run() {
     });
 
     // review routes
-    app.get("/api/reviews/:promptId", async (req, res) => {
+    app.get("/api/reviews/:promptId", verifyToken, async (req, res) => {
       const reviews = await reviewsCollection
-        .find({ promptId: req.params.promptId })
+        .find(
+          { promptId: req.params.promptId },
+          { projection: { userEmail: 0 } },
+        )
         .sort({ createdAt: -1 })
         .toArray();
       res.json({ success: true, reviews });
@@ -326,8 +332,8 @@ async function run() {
       res.json({ success: true, user });
     });
 
-    // top creators aggregation
-    app.get("/api/top-creators", async (req, res) => {
+    // top creators — email excluded from response
+    app.get("/api/top-creators", verifyToken, async (req, res) => {
       const creators = await promptsCollection
         .aggregate([
           { $match: { status: "approved" } },
@@ -341,6 +347,7 @@ async function run() {
           },
           { $sort: { totalCopies: -1 } },
           { $limit: 6 },
+          { $project: { _id: 0, name: 1, totalPrompts: 1, totalCopies: 1 } },
         ])
         .toArray();
       res.json({ success: true, creators });
