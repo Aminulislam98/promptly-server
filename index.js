@@ -109,7 +109,7 @@ async function run() {
       res.json({ success: true, prompts });
     });
 
-    app.get("/api/prompts/:id", async (req, res) => {
+    app.get("/api/prompts/:id", verifyToken, async (req, res) => {
       try {
         const prompt = await promptsCollection.findOne({
           _id: new ObjectId(req.params.id),
